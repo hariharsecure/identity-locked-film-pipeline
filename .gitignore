@@ -1,0 +1,29 @@
+# Machine-specific config (copy config.example.yaml -> config.yaml and fill in)
+config.yaml
+
+# Per-stage checkpoints (runtime artifacts) — keep the dir, ignore the JSON
+pipeline/checkpoints/*.json
+
+# Generated media + model assets (do NOT commit weights or rendered output)
+**/frames/
+**/anim/
+**/output/
+**/vo_clips/
+**/vo_clips_emotional/
+**/score/
+**/*.mp4
+**/*.mp3
+**/*.wav
+**/*.safetensors
+**/*_unet_peft/
+**/*_canonical_face.png
+**/_assemble_work/
+
+# Python / OS cruft
+__pycache__/
+*.py[cod]
+.DS_Store
+*.swp
+.venv/
+venv/
+.env

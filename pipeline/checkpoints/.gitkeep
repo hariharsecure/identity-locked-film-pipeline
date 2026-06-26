@@ -1,0 +1,2 @@
+# Per-stage JSON checkpoints land here at runtime (gitignored).
+# This .gitkeep keeps the empty directory in the repo.

@@ -1,0 +1,257 @@
+# =============================================================================
+# PIPELINE MANIFEST  (example / template)
+# =============================================================================
+# Formalizes an identity-locked generative-film pipeline as a resumable,
+# auditable, agent-drivable, governor-gated stage graph. Borrows the agentic-
+# orchestration PATTERN (manifest + tool-registry + checkpoints + review-gate +
+# per-stage director-skill) and pairs it with a local SDXL + per-character LoRA
+# + IP-Adapter identity-lock, Wan2.2 image-to-video, ffmpeg assemble, local TTS,
+# and local music, all RAM-gated by a memory governor.
+#
+# This manifest WRAPS your generation scripts. It does NOT replace or modify
+# them. Each stage's `tool` field names a tool-registry entry whose `entrypoint`
+# is one of your real scripts. The manifest is the contract; the scripts remain
+# the implementation. Read pipeline/README.md for the design rationale.
+#
+# NOTE: every value below (project name, character, wardrobe, seeds, paths) is a
+# NEUTRAL EXAMPLE. Replace `demo_character` with your own character, point the
+# entrypoints at your own scripts, and set the paths in `config.example.yaml`.
+# The example character used throughout is a PUBLIC-DOMAIN figure (Robin Hood),
+# never a real or proprietary likeness.
+# =============================================================================
+
+schema_version: "1.0"
+project: demo_film
+title: "Identity-locked agentic film pipeline (example manifest)"
+description: >
+  A character-driven short film. Two-stage generative core (SDXL keyframe ->
+  Wan2.2 image-to-video) + zero-model assemble/audio + a defect->fix QC loop.
+  Fully local, $0/shot. (Some upstream model weights are non-commercial — see
+  tool_registry.yaml > musicgen_score.license_note and THIRD_PARTY_LICENSES.md.)
+
+# ---------------------------------------------------------------------------
+# DIFFERENTIATORS (what a prompt-only / cartoon-rig agentic pipeline LACKS).
+# The pipeline is built AROUND these; do not "simplify" them away.
+# ---------------------------------------------------------------------------
+advantages:
+  identity_lock:
+    what: "Per-character PEFT LoRA + IP-Adapter ViT-H on a tight canonical face crop."
+    why: "Photoreal single-character continuity across a narrative film. Prompt-only or SVG-rig pipelines have no cross-shot photoreal identity."
+    ref: "recipe/IDENTITY_LOCK.md"
+  multichar_method:
+    what: "plate -> per-region LoRA inpaint (a single active PEFT adapter holds only one identity)."
+    why: "Two trained identities in one frame, without the adapters fighting."
+    ref: "recipe/IDENTITY_LOCK.md (multi-character section)"
+  qc_truth:
+    what: "A defect->fix decision tree is the QC authority (classify root cause, route to ONE knob)."
+    why: "Diagnose root cause BEFORE choosing a tool; never seed-sweep a still that is already wrong."
+    ref: "recipe/CONSISTENCY_QC.md"
+  governor_ram_gating:
+    what: "acquire_slot(name, est_gb) serializes heavy generation; one heavy job at a time."
+    why: "RAM-safety on a single workstation (concurrent local generation can OOM the machine)."
+    ref: "recipe/GOVERNOR.md"
+  local_owned:
+    what: "Fully local weights (SDXL + Wan2.2 + a local music model + local/edge TTS); no cloud keys."
+    why: "Owned, reproducible, $0/render. (Mind each upstream weight's own license — some are non-commercial.)"
+    ref: "THIRD_PARTY_LICENSES.md"
+
+# ---------------------------------------------------------------------------
+# GLOBAL POLICY
+# ---------------------------------------------------------------------------
+policy:
+  # Checkpoint advance policy per stage class:
+  #   gated_human   = a human must approve the review-gate before the next stage runs.
+  #   gated_self    = an agent self-reviews against a checklist; logs a verdict; auto-advances on PASS.
+  #   auto          = mechanical, no identity risk; auto-advances once artifacts verify.
+  checkpoint_policy: gated_human
+  # Heavy stages MUST acquire a governor slot. The runner refuses to start a heavy
+  # stage without a free slot; it never bypasses the governor.
+  governor_required_for: [keyframe, animate, audio_score]
+  never_overwrite_sources: true        # write to staging/suffixed names; a delivered master is sacred
+  resume: true                          # checkpoints make every stage skip-if-done + resumable
+  serial_heavy_jobs: true               # one acquire_slot at a time, always
+
+# ---------------------------------------------------------------------------
+# STAGES (a generic generative-film pipeline, in build order)
+# Each stage: id, the human-readable role, the tool (-> tool_registry.yaml),
+# inputs, outputs, deps (prior stage ids), the review-gate, RAM class, and the
+# director-skill that tells an agent how to run + verify it.
+# ---------------------------------------------------------------------------
+stages:
+
+  # === 1. KEYFRAME =========================================================
+  - id: keyframe
+    name: "Keyframe (SDXL + char-LoRA + IP-Adapter identity-lock)"
+    role: >
+      Decides WHO / WHERE / WHAT-COLOR. The root cause of most defects. SDXL-base-1.0
+      fp32/MPS, 1216x704, 34 steps, CFG 6.5; per-character PEFT LoRA + IP-Adapter ViT-H
+      on the canonical face crop (face-lock). Multi-char shots use plate -> per-region
+      LoRA inpaint. This is the identity-lock advantage.
+    tool: sdxl_keyframe
+    deps: []                            # consumes identity assets (LoRAs, canonical face crop) that pre-exist
+    inputs:
+      - "lora/<char>_lora/*_unet_peft (per-character PEFT LoRA)"
+      - "assets/<char>_canonical_face.png (IP-Adapter face crop)"
+      - "assets/style_anchor/*.png (no-people style anchor, scale <=0.15)"
+      - "the per-shot plan (a shot list; wardrobe/seed conventions for your character)"
+    outputs:
+      - "frames/<scene>/S##_*.png (locked keyframes, 1216x704)"
+      - "<stage_dir>/S##_buildlog.json (seed, LoRA weight, face-IP scale, passes — reproducibility)"
+    review_gate: gate_a                 # KEYFRAME / CONTACT-SHEET QA, batch-level, before any animation
+    ram_class: heavy                    # ~20 GB; governor slot required
+    director_skill: director_skills/01_keyframe.md
+    notes: >
+      A keyframe defect is NEVER fixed downstream — re-roll the keyframe. Gate A is the
+      hard stop. Lock a per-character wardrobe convention and verify the PIXELS, not the prompt.
+
+  # === 2. ANIMATE ==========================================================
+  - id: animate
+    name: "Animate (Wan2.2 image-to-video, seed-locked low-motion)"
+    role: >
+      Decides only HOW-IT-MOVES. Keyframe-anchored image->video via Wan2.2 on MPS.
+      Fixed seed (= keyframe seed), 4n+1 frame counts (73=3s..169=7s @24fps), steps 24-30,
+      --guide-scale 5.0 --shift 5.0 --scheduler unipc. Motion lives in the PROMPT. The I2V
+      pass carries NO IP-Adapter — anchor coherence is a keyframe-stage property only.
+    tool: wan_i2v
+    deps: [keyframe]                    # animates ONLY a Gate-A-passed keyframe
+    inputs:
+      - "frames/<scene>/S##_*.png (the LOCKED, Gate-A-passed keyframe — READ-ONLY)"
+      - "per-shot: num_frames, seed (=keyframe seed), low-motion prompt, motion_note"
+    outputs:
+      - "anim/<scene>/S##_*_anim.mp4 (per-shot I2V clips, 24fps)"
+      - "anim/<scene>/*_animation_manifest.json (per-shot seed/frames/verify — ffprobe)"
+    review_gate: gate_b_clip            # per-shot flicker/drift QA (subset of Gate B)
+    ram_class: heavy                    # ~22 GB; governor slot required
+    director_skill: director_skills/02_animate.md
+    notes: >
+      Deliberate two-/multi-figure shots use TWO_FIGURE_NEG (drop duplicate/identity-change terms).
+      Never animate a still that has not passed Gate A — a motion pass cannot rescue a bad frame.
+
+  # === 3. ASSEMBLE =========================================================
+  - id: assemble
+    name: "Assemble (pure ffmpeg: swap / retime / concat / mux)"
+    role: >
+      Zero-model. Swaps per-shot clips into the timeline at frame-exact windows,
+      applies the retime filtergraph, concatenates in film order, and muxes audio.
+      No identity risk. NEVER overwrites a delivered master.
+    tool: ffmpeg_assemble
+    deps: [animate, audio_vo, audio_score]   # needs shots + the mixed audio (VO + score + beds)
+    inputs:
+      - "anim/<scene>/S##_*_anim.mp4 (per-shot clips)"
+      - "the prior video-noaudio timeline + per-shot windows (frame counts)"
+      - "a MIXED audio source (VO + score + beds), produced by a prior mix pass"
+    outputs:
+      - "output/film_<label>.mp4 (assembled cut)"
+      - "<work>/concat_*.txt, <work>/full_video_noaudio_*.mp4 (intermediate, resumable)"
+    review_gate: gate_b_cut             # FINAL QA on the assembled cut
+    ram_class: light                    # ffmpeg only; no governor slot needed
+    director_skill: director_skills/03_assemble.md
+    notes: >
+      Frame-exact: every concat re-encodes to a uniform codec/fps and asserts frame counts
+      match the source timeline. A shot on HOLD (identity drift) falls back to its
+      Ken-Burns/static clip via hold.json — no code edit.
+
+  # === 4a. AUDIO — VOICEOVER ===============================================
+  - id: audio_vo
+    name: "Audio — Voiceover (TTS)"
+    role: >
+      Per-line VO. A light network TTS (e.g. edge-tts) for the temp pass; a local
+      emotional TTS for the final pass. loudnorm I=-16. Casting (voice per speaker)
+      is an authoring decision.
+    tool: tts_vo
+    deps: []                            # VO is authored from the script; parallel to keyframe/animate
+    inputs:
+      - "a VO script (the voiced lines + speaker)"
+      - "a casting table (voice per speaker)"
+    outputs:
+      - "vo_clips/S##_<speaker>_<voice>.mp3 + vo_clips/VO_MANIFEST.json"
+      - "(final) vo_clips_emotional/* (local emotional TTS pass)"
+    review_gate: gate_audio
+    ram_class: light                    # network temp pass is light; the local emotional pass is heavier (see registry)
+    director_skill: director_skills/04_audio_vo.md
+    notes: "Off-screen V.O. needs no lip-sync (audio-place only); on-screen dialogue routes through a lip-sync sub-step."
+
+  # === 4b. AUDIO — SCORE ===================================================
+  - id: audio_score
+    name: "Audio — Score (local music model, per-beat cues)"
+    role: >
+      Per-beat musical cues. A local music model (e.g. MusicGen) for the temp score;
+      a commercially-licensed library/model is the later upgrade. loudnorm I=-18.
+    tool: musicgen_score
+    deps: []                            # parallel to the visual stages
+    inputs:
+      - "a sound-design plan (the cue list + per-beat mood)"
+    outputs:
+      - "score/C##_*.wav + score/SCORE_MANIFEST.json"
+    review_gate: gate_audio
+    ram_class: heavy                    # ~6 GB; governor slot required (single slot for the whole batch)
+    director_skill: director_skills/05_audio_score.md
+    notes: "One governor slot for the whole batch. The mix (VO+score+beds, ducking) happens in assemble. (MusicGen weights are non-commercial — see registry license_note.)"
+
+  # === 5. QC (cross-cutting) ===============================================
+  # QC is not a linear stage — it is the review-gate logic that runs at Gate A
+  # (keyframe), Gate B (clip + cut), and audio. It is listed here so the manifest
+  # records it as a first-class concern with its own director-skill. The actual
+  # routing lives in recipe/CONSISTENCY_QC.md (the defect->fix decision tree).
+  - id: qc
+    name: "QC (defect->fix routing)"
+    role: >
+      The QC authority. Classify a defect's root cause in ONE category, route to the
+      ONE knob, re-gen governor-gated/serial, verify against your character canon, log it.
+      Owns Gate A (keyframe) and Gate B (clip + cut).
+    tool: consistency_qc
+    deps: []                            # cross-cutting; invoked by every review-gate
+    inputs:
+      - "the artifact under review (keyframe PNG / shot mp4 / assembled cut)"
+      - "recipe/CONSISTENCY_QC.md (the defect->fix routing)"
+    outputs:
+      - "a verdict (PASS / REWORK + the named defect category + the routed knob)"
+      - "checkpoints/<stage>.json review-gate record (who/when/verdict/notes)"
+    review_gate: null                   # QC IS the gate logic; it does not have its own downstream gate
+    ram_class: light
+    director_skill: director_skills/06_qc.md
+    notes: "The single most expensive mistake is seed-sweeping a bad still. Diagnose at the keyframe first."
+
+# ---------------------------------------------------------------------------
+# REVIEW GATES (the human + self-review approval points).
+# A stage does not advance past its gate with an open defect. Each gate's
+# checklist lives in its director-skill; the gate RECORD is written to the checkpoint JSON.
+# ---------------------------------------------------------------------------
+gates:
+  gate_a:
+    name: "GATE A — Keyframe / contact-sheet QA"
+    when: "after keyframe, batch-level, BEFORE any animation"
+    policy: gated_human
+    checklist_ref: "director_skills/01_keyframe.md (Gate A) + recipe/CONSISTENCY_QC.md"
+    fail_action: "re-roll the keyframe (route via CONSISTENCY_QC #1); do NOT animate."
+  gate_b_clip:
+    name: "GATE B (clip) — per-shot flicker/drift QA"
+    when: "after animate, per shot"
+    policy: gated_self                  # agent self-reviews frames f0/mid/tail; PASS auto-advances
+    checklist_ref: "director_skills/02_animate.md (Gate B identity-holds-to-tail)"
+    fail_action: "route via CONSISTENCY_QC (#2 seed-sweep / #3 short-core / #5 trim)."
+  gate_b_cut:
+    name: "GATE B (cut) — final QA on the assembled cut"
+    when: "after assemble"
+    policy: gated_human
+    checklist_ref: "director_skills/03_assemble.md (Gate B) — identity-to-tail, no flicker, audio synced, crop safe"
+    fail_action: "identify the offending shot; re-open its stage (keyframe or animate), not the whole cut."
+  gate_audio:
+    name: "GATE AUDIO — VO + score QA"
+    when: "after audio_vo and audio_score"
+    policy: gated_self
+    checklist_ref: "director_skills/04_audio_vo.md + 05_audio_score.md (duration proportional to text; loudnorm correct; on-style)"
+    fail_action: "re-gen the offending line/cue; never re-mux a wrong stem."
+
+# ---------------------------------------------------------------------------
+# EXECUTION ORDER (a topological view; the runner derives this from deps).
+# Visual spine: keyframe -> animate -> assemble.
+# Audio spine (parallel): audio_vo, audio_score -> (feed) assemble.
+# QC is cross-cutting (Gate A on keyframe; Gate B on animate+assemble; audio gate).
+# ---------------------------------------------------------------------------
+execution:
+  parallelizable:
+    - "audio_vo, audio_score may run in parallel with keyframe/animate (different RAM class)"
+    - "BUT heavy stages still serialize through the governor — never two acquire_slot at once"
+  critical_path: [keyframe, animate, assemble]
+  join: "assemble depends on animate + audio_vo + audio_score"

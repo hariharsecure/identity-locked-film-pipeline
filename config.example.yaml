@@ -1,0 +1,27 @@
+# config.example.yaml — machine-specific paths live HERE, not in the manifest.
+# Copy to `config.yaml` (gitignored) and fill in YOUR absolute paths. Nothing in
+# pipeline.yaml / tool_registry.yaml should hard-code a machine path; they use
+# <PATH_TO> placeholders + repo-relative paths, and read the real values from here.
+
+# A RAM-slot governor that serializes heavy local generation (see recipe/GOVERNOR.md).
+# Point this at your governor module (the reference scripts import `acquire_slot`).
+governor_path: /absolute/path/to/memory_governor.py
+
+# Wan2.2 image-to-video (MLX on Apple silicon).
+wan:
+  python: /absolute/path/to/venv_wanmlx/bin/python      # a venv that has mlx_video
+  model_dir: /absolute/path/to/Wan2.2-TI2V-5B-MLX       # the local Wan2.2 checkpoint dir
+
+# Where your project's artifacts live (frames, anim, audio, output). Repo-relative is fine.
+paths:
+  project_root: .
+  frames: examples/demo_character/frames
+  anim: examples/demo_character/anim
+  output: examples/demo_character/output
+
+# Heavy-stage RAM estimates (GB) for the governor's acquire_slot(est_gb=...).
+governor_est_gb:
+  keyframe: 20.0
+  animate: 22.0
+  audio_score: 6.0
+  audio_vo_emotional: 8.0

@@ -1,0 +1,230 @@
+# =============================================================================
+# TOOL REGISTRY  (example / template)
+# =============================================================================
+# Each tool = one of YOUR generation scripts (or a small family of them), declared
+# with the metadata an agent / the runner needs to drive it safely:
+#   purpose, runtime class, in/out, RAM cost (for the memory governor), the
+#   governor est_gb, a fallback chain, the director-skill, and the canonical
+#   entrypoint(s) (the real script that does the work — UNMODIFIED).
+#
+# This implements the auto-discovering-tool-registry PATTERN (name/runtime/cost/
+# fallback/dependencies/skills + auto-discovery) for a LOCAL stack. The
+# auto-discovery is in tools.py (load_registry + validate); it walks this file +
+# asserts every entrypoint exists on disk.
+#
+# RUNTIME classes: LOCAL_MPS (heavy, MPS, governor slot), LOCAL_CPU (ffmpeg/PIL,
+# no slot), NETWORK (a network TTS), DOC (a markdown discipline, not code).
+#
+# RAM cost feeds acquire_slot(name, est_gb=<governor_est_gb>).
+#
+# NOTE: the entrypoints below point at the project-agnostic REFERENCE scripts in
+# recipe/ so `tools.py validate` resolves out-of-the-box. In a real project you
+# repoint each entrypoint at your own tuned scripts (which may live anywhere under
+# the project root). Paths in `binary` / `model_dir` / `governor` are PLACEHOLDERS —
+# set them in config.example.yaml; nothing here hard-codes a real machine path.
+# =============================================================================
+
+schema_version: "1.0"
+registry_root: .                                   # project root (set per-project; see config.example.yaml)
+governor: <PATH_TO>/memory_governor.py             # PLACEHOLDER — a RAM-slot governor (see recipe/GOVERNOR.md)
+
+tools:
+
+  # --- KEYFRAME ------------------------------------------------------------
+  sdxl_keyframe:
+    stage: keyframe
+    purpose: >
+      Generate a LOCKED keyframe: SDXL-base-1.0 fp32/MPS + per-character PEFT char-LoRA
+      + IP-Adapter ViT-H on the canonical face crop (face-lock). Multi-char shots run
+      plate (no-LoRA composition) -> per-region LoRA inpaint. This is the identity-lock.
+    runtime: LOCAL_MPS
+    governor_est_gb: 20.0               # SDXL fp32 keyframe on MPS, measured peak
+    inputs:
+      - char LoRA (lora/<char>_lora/*_unet_peft)
+      - canonical face crop (assets/<char>_canonical_face.png)
+      - style anchor PNG (scale <=0.15)
+      - per-shot plan (wardrobe/seed conventions)
+    outputs:
+      - frames/<scene>/S##_*.png
+      - <stage>/S##_buildlog.json (seed, lora_w, face_ip, passes)
+    entrypoints:
+      # Repoint these at your own scripts. The reference impl ships in recipe/.
+      keyframe_ref: recipe/keyframe_identity_lock.py     # the SDXL+LoRA+IP-Adapter wiring (placeholder triggers/wardrobe)
+    invocation:
+      single: "python3 recipe/keyframe_identity_lock.py --shot S01 --seed 1234 --char demo_character"
+      multichar: "python3 recipe/keyframe_identity_lock.py --shot S02 --multichar --plate <plate.png>"
+    key_settings:
+      res: [1216, 704]
+      steps: 34
+      cfg: 6.5
+      ip_face_scale: "per-shot (0.30 medium-CU / 0.45 inside a masked two-shot box)"
+      style_anchor_scale: 0.15
+      lora_weight: "1.0 (1.15 to fight drift in a close-up)"
+      onnxruntime: blocked                # optional: hard-block onnxruntime if you want to avoid an insightface dependency
+    fallback:
+      - "re-roll seed (a wrong still is re-keyed, never patched)"
+      - "if 2-char LoRA-domination: switch to plate->region-inpaint (multichar path)"
+    gate: gate_a
+    director_skill: director_skills/01_keyframe.md
+    advantage: "Photoreal cross-shot identity that prompt-only / SVG-rig pipelines lack."
+
+  # --- ANIMATE -------------------------------------------------------------
+  wan_i2v:
+    stage: animate
+    purpose: >
+      Keyframe-anchored image->video (Wan2.2) on MPS. Fixed seed, 4n+1 frames,
+      low-motion-in-prompt, unipc/shift 5.0/guide 5.0. No IP-Adapter in this pass.
+      Deliberate two-figure shots use TWO_FIGURE_NEG.
+    runtime: LOCAL_MPS
+    governor_est_gb: 22.0               # Wan2.2 I2V on MPS, measured peak
+    binary: <PATH_TO>/python -m mlx_video.models.wan_2.generate   # PLACEHOLDER (set in config.example.yaml)
+    model_dir: <PATH_TO>/Wan2.2-TI2V-5B-MLX                       # PLACEHOLDER
+    inputs:
+      - the LOCKED keyframe PNG (READ-ONLY)
+      - per-shot num_frames / seed / low-motion prompt
+    outputs:
+      - anim/<scene>/S##_*_anim.mp4
+      - anim/<scene>/*_animation_manifest.json
+    entrypoints:
+      animate_ref: recipe/wan_i2v.py      # the seed-locked low-motion I2V invocation (reference)
+    invocation:
+      subset: "python3 recipe/wan_i2v.py S01 S02   # optional tag prefixes -> run a subset; skip-if-exists resumes"
+    key_settings:
+      fps: 24
+      frame_counts: {3s: 73, 4s: 97, 5s: 121, 6s: 145, 7s: 169}   # 4n+1
+      steps: "24 low-motion / 30 fix-shots + payoffs"
+      guide_scale: 5.0
+      shift: 5.0
+      scheduler: unipc
+      seed: "fixed = keyframe seed"
+      two_figure_neg: "drop duplicate/identity-change terms for deliberate 2-figure shots"
+    fallback:
+      - "tail-drift: lower --guide-scale to 4.5 + anti-morph negative"
+      - "near-static long shot unstable: short-core + minterpolate (e.g. 145f -> 331f window)"
+      - "flat/scenic beat: route OUT to depth-parallax (zero regeneration, zero identity risk)"
+      - "marginal/head-or-tail defect: trim (ffmpeg) instead of a seed-sweep"
+    gate: gate_b_clip
+    director_skill: director_skills/02_animate.md
+    advantage: "Apple-silicon-native MLX path sidesteps the float8-on-MPS ComfyUI break; seed-locked to the keyframe."
+
+  # --- ASSEMBLE ------------------------------------------------------------
+  ffmpeg_assemble:
+    stage: assemble
+    purpose: >
+      Pure ffmpeg. Swap per-shot clips into the timeline at frame-exact windows,
+      apply the retime filtergraph, concat in film order, mux audio. Zero model,
+      zero identity risk. Asserts frame counts match the source timeline.
+    runtime: LOCAL_CPU
+    governor_est_gb: 0.0                 # ffmpeg; no governor slot needed
+    inputs:
+      - per-shot clips (anim/<scene>/S##_*_anim.mp4)
+      - the prior video-noaudio timeline + per-shot windows
+      - the audio stream to mux (VO + score + beds)
+    outputs:
+      - output/film_<label>.mp4
+      - <work>/full_video_noaudio_*.mp4, <work>/concat_*.txt (intermediate, resumable)
+    entrypoints:
+      assemble_ref: recipe/assemble.py    # the frame-exact swap/retime/mux pattern (reference)
+    invocation:
+      full: "python3 recipe/assemble.py all   # or 'base' / 'mux'"
+    key_settings:
+      fps: 24
+      res: [1216, 704]
+      crf: 18
+      codec: libx264 (profile high)
+      hold_fallback: "hold.json -> a HOLD shot uses its Ken-Burns/static clip (no code edit)"
+      frame_exact_guard: "assert produced_frames == source_frames (timeline-drift trip)"
+    fallback:
+      - "a shot drifting in motion: add it to hold.json -> static/Ken-Burns fallback clip"
+    gate: gate_b_cut
+    director_skill: director_skills/03_assemble.md
+    advantage: "NEVER overwrites a delivered master; frame-exact resumable swaps."
+
+  # --- AUDIO: VO -----------------------------------------------------------
+  tts_vo:
+    stage: audio_vo
+    purpose: >
+      Per-line voiceover. A network TTS (e.g. edge-tts, light) for the temp pass;
+      a local emotional TTS for the final pass. loudnorm I=-16. Casting per speaker.
+    # TWO sub-tools share this stage: a NETWORK temp pass and a LOCAL_MPS emotional pass.
+    runtime: NETWORK                      # the temp pass; the emotional pass is LOCAL_MPS (see below)
+    governor_est_gb: 0.0                  # for the temp network pass; the emotional pass needs ~8.0 (see governor_est_gb_emotional)
+    governor_est_gb_emotional: 8.0        # the local emotional-TTS pass IS a heavy slot
+    inputs:
+      - a VO script (voiced lines + speaker)
+      - the casting table
+    outputs:
+      - vo_clips/S##_<speaker>_<voice>.mp3 + vo_clips/VO_MANIFEST.json   (temp)
+      - vo_clips_emotional/*                                            (final emotional pass)
+    entrypoints:
+      # The reference script implements the edge-tts temp pass + loudnorm + duration-verify.
+      vo_ref: recipe/tts_vo.py
+    invocation:
+      temp: "python3 recipe/tts_vo.py"
+    key_settings:
+      loudnorm: "I=-16:TP=-1.5:LRA=11"
+      casting:
+        # EXAMPLE casting only — replace with your own speakers/voices.
+        narrator: "<your-locale>-<VoiceName>Neural"
+        character_a: "<your-locale>-<VoiceName>Neural"
+        character_b: "<your-locale>-<VoiceName>Neural"
+    fallback:
+      - "the emotional pass is the upgrade over the network temp pass; it IS a governor slot (est_gb~8.0)"
+      - "lip-sync for on-screen dialogue: a viseme tool -> composite mouth sprites (CPU)"
+    gate: gate_audio
+    director_skill: director_skills/04_audio_vo.md
+    advantage: "A local emotional voice-design pass over a plain TTS temp pass."
+
+  # --- AUDIO: SCORE --------------------------------------------------------
+  musicgen_score:
+    stage: audio_score
+    purpose: >
+      Per-beat musical cues. A local music model (e.g. MusicGen-small, MPS) for the
+      temp score; a commercially-licensed library/model is the later upgrade. loudnorm I=-18.
+    runtime: LOCAL_MPS
+    governor_est_gb: 6.0                  # local music model on MPS, measured peak
+    inputs:
+      - a sound-design plan (cue list + per-beat mood)
+    outputs:
+      - score/C##_*.wav + score/SCORE_MANIFEST.json
+    entrypoints:
+      # Reference is documentation-led (recipe/CONSISTENCY_QC.md + GOVERNOR.md cover the pattern);
+      # plug in your own music-gen script here.
+      score_ref: recipe/musicgen_score.py
+    invocation:
+      run: "python3 recipe/musicgen_score.py"
+    key_settings:
+      model: "facebook/musicgen-small (example)"
+      loudnorm: "I=-18:TP=-2:LRA=11"
+      one_slot_whole_batch: true
+    license_note: >
+      MusicGen-small WEIGHTS are CC-BY-NC-4.0 (NON-commercial). It is a fully-LOCAL temp
+      score, but it is NOT commercial-clean — a commercially-released cut must swap to a
+      commercially-licensed score (Stable Audio Open / a licensed library / original music).
+      Do not claim "commercial-clean" for the MusicGen stage. See THIRD_PARTY_LICENSES.md.
+    fallback:
+      - "single bad cue: re-gen ONE cue, never the whole batch"
+      - "commercial release: swap to a commercially-licensed score (MusicGen is NC)"
+    gate: gate_audio
+    director_skill: director_skills/05_audio_score.md
+    advantage: "Fully local music for the TEMP score; deterministic per-cue re-gen. (NC-licensed — swap for a commercial release.)"
+
+  # --- QC (a DISCIPLINE, not a binary) ------------------------------------
+  consistency_qc:
+    stage: qc
+    purpose: >
+      The QC authority. Classify a defect's root cause in ONE category, route to the ONE
+      knob (the defect->fix decision tree), re-gen governor-gated/serial, verify against
+      your character canon, log it. Owns Gate A (keyframe) and Gate B (clip + cut).
+    runtime: DOC                          # a markdown discipline + your own diag/verify helper scripts
+    governor_est_gb: 0.0
+    inputs:
+      - the artifact under review (keyframe PNG / shot mp4 / assembled cut)
+      - recipe/CONSISTENCY_QC.md (the defect->fix routing)
+    entrypoints:
+      qc_doc: recipe/CONSISTENCY_QC.md
+    routing_ref: "recipe/CONSISTENCY_QC.md (the convergence decision tree)"
+    fallback: []
+    gate: null                            # QC IS the gate logic
+    director_skill: director_skills/06_qc.md
+    advantage: "Empirical defect->fix routing instead of a generic reviewer skill."
