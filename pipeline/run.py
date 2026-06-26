@@ -156,7 +156,7 @@ def cmd_next() -> int:
         print(f"  director     : {st.get('director_skill')}")
         gb = tool.get("governor_est_gb", 0.0)
         if gb and gb > 0:
-            print(f"  governor    : acquire_slot('{sid}_<tag>', est_gb={gb}, timeout_s=7200)  # one heavy job at a time")
+            print(f"  governor    : acquire_slot('{sid}_<tag>', est_gb={gb}, timeout_s=7200)  # RAM-budget gate: concurrent if it fits, blocks when the budget would be exceeded")
         else:
             print(f"  governor    : none needed ({tool.get('runtime')}, est_gb={gb})")
         inv = tool.get("invocation", {})
@@ -166,6 +166,7 @@ def cmd_next() -> int:
                 print(f"      ({k}) {v}")
         print(f"  gate        : {st.get('review_gate')} — stamp it after the gate QC passes:")
         print(f"      python3 checkpoint.py record {sid} --produced '<glob>'")
+        print(f"      python3 checkpoint.py verify {sid} <artifact> ...   # the ones that passed the gate")
         print(f"      python3 checkpoint.py gate   {sid} --verdict PASS --by <you>")
         return 0
     print("No runnable stage — all stages are either done or blocked on an unstamped gate.")

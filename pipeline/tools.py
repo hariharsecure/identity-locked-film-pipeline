@@ -153,7 +153,7 @@ def _cmd_governor(name: str) -> int:
     gb = tool.get("governor_est_gb", 0.0)
     if gb and gb > 0:
         print(f"with acquire_slot('{tool.get('stage')}_<tag>', est_gb={gb}, timeout_s=7200):")
-        print(f"    # run {name} ({tool.get('runtime')}) — one heavy job at a time")
+        print(f"    # run {name} ({tool.get('runtime')}) — RAM-budget gate: concurrent if it fits, else it waits")
     else:
         print(f"# {name} is {tool.get('runtime')} (est_gb={gb}) — NO governor slot needed")
     return 0

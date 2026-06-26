@@ -32,6 +32,7 @@ Heavy stage → serial with all other heavy gen.
 ## Record the checkpoint + stamp the gate
 ```
 python3 ../checkpoint.py record audio_score --produced 'score/C*.wav' 'score/SCORE_MANIFEST.json'
+python3 ../checkpoint.py verify audio_score SCORE_MANIFEST.json C01_open.wav      # the cues that passed Gate AUDIO
 python3 ../checkpoint.py gate   audio_score --verdict PASS --by agent --notes "actual_s≈target_s, on-palette, loudnorm ok"
 ```
 

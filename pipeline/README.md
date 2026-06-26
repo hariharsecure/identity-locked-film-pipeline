@@ -64,7 +64,8 @@ python3 checkpoint.py gate   keyframe --verdict PASS --by reviewer --notes "Gate
 # -> now `animate` becomes runnable (run.py plan shows it unblocked)
 ```
 The planner **gate-blocks** a stage until its upstream gate is stamped `PASS` — this is the human-in-the-loop
-review discipline. Heavy stages acquire a memory-governor slot (one at a time). Nothing here auto-runs
+review discipline. Heavy stages acquire a memory-governor slot — a RAM-budget reservation that admits
+concurrent jobs while they fit and blocks one only when the budget would be exceeded. Nothing here auto-runs
 heavy gen; it prints the command for a human/agent to run, so the gate + governor discipline stays intact.
 
 ## The borrowed pattern — and what is original

@@ -45,6 +45,7 @@ serial like any heavy stage.
 ## Record the checkpoint + stamp the gate
 ```
 python3 ../checkpoint.py record audio_vo --produced 'vo_clips/S*.mp3' 'vo_clips/VO_MANIFEST.json'
+python3 ../checkpoint.py verify audio_vo VO_MANIFEST.json S01_narrator.mp3       # the clips that passed Gate AUDIO
 python3 ../checkpoint.py gate   audio_vo --verdict PASS --by agent --notes "durations proportional, loudnorm ok, casting matches"
 ```
 On a bad line: re-gen **that line only** — never re-mux a wrong stem.

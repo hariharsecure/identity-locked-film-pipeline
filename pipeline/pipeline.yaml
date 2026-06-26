@@ -47,8 +47,8 @@ advantages:
     why: "Diagnose root cause BEFORE choosing a tool; never seed-sweep a still that is already wrong."
     ref: "recipe/CONSISTENCY_QC.md"
   governor_ram_gating:
-    what: "acquire_slot(name, est_gb) serializes heavy generation; one heavy job at a time."
-    why: "RAM-safety on a single workstation (concurrent local generation can OOM the machine)."
+    what: "acquire_slot(name, est_gb) is a RAM-budget admission gate — it admits concurrent heavy jobs while the combined estimate + headroom fits, and blocks a job only when the budget would be exceeded."
+    why: "RAM-safety on a single workstation (unbounded concurrent local generation can OOM the machine), without leaving memory idle the way a strict single slot does."
     ref: "recipe/GOVERNOR.md"
   local_owned:
     what: "Fully local weights (SDXL + Wan2.2 + a local music model + local/edge TTS); no cloud keys."
@@ -64,12 +64,14 @@ policy:
   #   gated_self    = an agent self-reviews against a checklist; logs a verdict; auto-advances on PASS.
   #   auto          = mechanical, no identity risk; auto-advances once artifacts verify.
   checkpoint_policy: gated_human
-  # Heavy stages MUST acquire a governor slot. The runner refuses to start a heavy
-  # stage without a free slot; it never bypasses the governor.
+  # Heavy stages MUST acquire a governor slot (a RAM-budget reservation). The
+  # governor admits the job only when its estimate + headroom fits in available
+  # RAM; it never bypasses the governor. It does NOT force strict single-job
+  # serialization — concurrent heavy jobs are allowed while the budget fits.
   governor_required_for: [keyframe, animate, audio_score]
   never_overwrite_sources: true        # write to staging/suffixed names; a delivered master is sacred
   resume: true                          # checkpoints make every stage skip-if-done + resumable
-  serial_heavy_jobs: true               # one acquire_slot at a time, always
+  governor_ram_budget: true             # acquire_slot = RAM-budget admission; concurrent-if-it-fits, blocks when the budget would be exceeded
 
 # ---------------------------------------------------------------------------
 # STAGES (a generic generative-film pipeline, in build order)
@@ -252,6 +254,6 @@ gates:
 execution:
   parallelizable:
     - "audio_vo, audio_score may run in parallel with keyframe/animate (different RAM class)"
-    - "BUT heavy stages still serialize through the governor — never two acquire_slot at once"
+    - "heavy stages are admitted by the governor's RAM budget — concurrent runs are allowed while the combined estimate + headroom fits; a job blocks only when the budget would be exceeded"
   critical_path: [keyframe, animate, assemble]
   join: "assemble depends on animate + audio_vo + audio_score"
