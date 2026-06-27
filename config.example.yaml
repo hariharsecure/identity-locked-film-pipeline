@@ -6,6 +6,7 @@
 # A RAM-slot governor that serializes heavy local generation (see recipe/GOVERNOR.md).
 # Point this at your governor module (the reference scripts import `acquire_slot`).
 governor_path: /absolute/path/to/memory_governor.py
+governor_timeout_s: 7200
 
 # Wan2.2 image-to-video (MLX on Apple silicon).
 wan:

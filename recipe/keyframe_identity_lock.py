@@ -60,16 +60,14 @@ except Exception:  # pragma: no cover - reference fallback
         print(f"[governor] (no-op) would acquire '{name}' est_gb={est_gb}", flush=True)
         yield
 
-import torch  # noqa: E402
-from diffusers import StableDiffusionXLPipeline  # noqa: E402
-from peft import PeftModel  # noqa: E402
-
 # --- CONFIG (edit these for your project) ----------------------------------------------
 SDXL = "stabilityai/stable-diffusion-xl-base-1.0"
 ROOT = Path(__file__).resolve().parent.parent          # repo root (set as you like)
+sys.path.insert(0, str(ROOT / "pipeline"))
+from project import ProjectError, load_project, project_paths  # noqa: E402
+
 ASSETS = ROOT / "examples" / "demo_character"
 OUT = ROOT / "examples" / "demo_character" / "frames"
-DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 W, H, STEPS, CFG = 1216, 704, 34, 6.5
 
 # PLACEHOLDER identity constants — replace with YOUR trained trigger + wardrobe canon.
@@ -108,6 +106,81 @@ SHOTS = {
 }
 
 
+def default_context() -> dict:
+    return {
+        "assets": ASSETS,
+        "frames": OUT,
+        "shots": {tag: dict(spec, out_dir=OUT, who=["demo_character"]) for tag, spec in SHOTS.items()},
+        "style": STYLE,
+        "neg": NEG,
+        "solo_neg": SOLO_NEG,
+        "two_figure_neg": TWO_FIGURE_NEG,
+        "use_two_figure_neg": False,
+        "res": [W, H],
+        "steps": STEPS,
+        "cfg": CFG,
+        "triggers": {"demo_character": TRIGGER},
+        "wardrobe": {"demo_character": WARDROBE},
+        "lora_dirs": dict(LORA_DIRS),
+        "face_crops": dict(FACE_CROPS),
+    }
+
+
+def _maybe_path(base: Path, value):
+    if value is None:
+        return None
+    p = Path(str(value))
+    return p if p.is_absolute() else base / p
+
+
+def load_project_context(project_arg: str) -> dict:
+    proj = load_project(project_arg)
+    paths = project_paths(proj)
+    render = proj.get("render") or {}
+    keyframe = render.get("keyframe") or {}
+    identity = proj.get("identity") or {}
+    triggers = {}
+    wardrobe = {}
+    lora_dirs = {}
+    face_crops = {}
+    for char_id, spec in identity.items():
+        triggers[char_id] = spec.get("trigger", "")
+        wardrobe[char_id] = spec.get("wardrobe", "")
+        lora_dirs[char_id] = _maybe_path(paths["root"], spec.get("lora_dir"))
+        face_crops[char_id] = _maybe_path(paths["root"], spec.get("face_crop"))
+    shots = {}
+    for shot in proj.get("shots") or []:
+        tag = shot.get("id", "")
+        scene = shot.get("scene")
+        out_dir = paths["frames"] / scene if scene else paths["frames"]
+        shots[tag] = {
+            "seed": int(shot.get("seed") or 0),
+            "solo": bool(shot.get("solo")),
+            "body": shot.get("keyframe_prompt", ""),
+            "who": list(shot.get("who") or []),
+            "out_dir": out_dir,
+        }
+    negatives = proj.get("negatives") or {}
+    res = render.get("res") or [W, H]
+    return {
+        "assets": paths["root"],
+        "frames": paths["frames"],
+        "shots": shots,
+        "style": proj.get("style", STYLE),
+        "neg": negatives.get("base", NEG),
+        "solo_neg": negatives.get("solo_extra", SOLO_NEG),
+        "two_figure_neg": negatives.get("two_figure", TWO_FIGURE_NEG),
+        "use_two_figure_neg": True,
+        "res": res,
+        "steps": int(keyframe.get("steps", STEPS)),
+        "cfg": float(keyframe.get("cfg", CFG)),
+        "triggers": triggers,
+        "wardrobe": wardrobe,
+        "lora_dirs": lora_dirs,
+        "face_crops": face_crops,
+    }
+
+
 def set_lora_weight(unet, w: float) -> int:
     """Set LoRA scale via set_scale() (cross_attention_kwargs is a no-op on a wrapped UNet)."""
     n = 0
@@ -121,12 +194,19 @@ def set_lora_weight(unet, w: float) -> int:
     return n
 
 
-def load_pipe(char: str, lora_w: float = 1.0):
-    print(f"[load] SDXL + {char} LoRA on {DEVICE}", flush=True)
+def _device(torch_mod) -> str:
+    return "mps" if torch_mod.backends.mps.is_available() else "cpu"
+
+
+def load_pipe(char: str, ctx: dict, torch_mod, device: str, lora_w: float = 1.0):
+    from diffusers import StableDiffusionXLPipeline
+    from peft import PeftModel
+
+    print(f"[load] SDXL + {char} LoRA on {device}", flush=True)
     pipe = StableDiffusionXLPipeline.from_pretrained(
-        SDXL, torch_dtype=torch.float32, use_safetensors=True).to(DEVICE)
+        SDXL, torch_dtype=torch_mod.float32, use_safetensors=True).to(device)
     pipe.set_progress_bar_config(disable=True)
-    lora_dir = LORA_DIRS.get(char)
+    lora_dir = ctx["lora_dirs"].get(char)
     if lora_dir and Path(lora_dir).exists():
         pipe.unet = PeftModel.from_pretrained(pipe.unet, str(lora_dir))
         n = set_lora_weight(pipe.unet, lora_w)
@@ -139,35 +219,50 @@ def load_pipe(char: str, lora_w: float = 1.0):
     return pipe
 
 
-def gen_single(args) -> None:
-    OUT.mkdir(parents=True, exist_ok=True)
-    s = SHOTS[args.shot]
+def gen_single(args, ctx: dict) -> None:
+    import torch
+
+    s = ctx["shots"][args.shot]
+    char = args.char
+    if char not in ctx["lora_dirs"] and s.get("who"):
+        char = s["who"][0]
+    out_dir = s["out_dir"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    device = _device(torch)
+    w, h = ctx["res"]
     results = []
     with acquire_slot(f"keyframe_{args.shot}", est_gb=20.0, timeout_s=10800):
-        pipe = load_pipe(args.char, lora_w=1.0)
-        neg = NEG + (SOLO_NEG if s["solo"] else "")
-        prompt = f"{s['body']}, {STYLE}"
-        g = torch.Generator(device=DEVICE).manual_seed(args.seed or s["seed"])
-        img = pipe(prompt=prompt, negative_prompt=neg, width=W, height=H,
-                   num_inference_steps=STEPS, guidance_scale=CFG, generator=g).images[0]
-        fn = OUT / f"{args.shot}.png"
+        pipe = load_pipe(char, ctx, torch, device, lora_w=1.0)
+        if s["solo"]:
+            neg = ctx["neg"] + ctx["solo_neg"]
+        elif ctx.get("use_two_figure_neg"):
+            neg = ctx["two_figure_neg"]
+        else:
+            neg = ctx["neg"]
+        prompt = f"{s['body']}, {ctx['style']}"
+        seed = args.seed or s["seed"]
+        g = torch.Generator(device=device).manual_seed(seed)
+        img = pipe(prompt=prompt, negative_prompt=neg, width=w, height=h,
+                   num_inference_steps=ctx["steps"], guidance_scale=ctx["cfg"], generator=g).images[0]
+        fn = out_dir / f"{args.shot}.png"
         img.save(fn)
-        results.append({"shot": args.shot, "seed": args.seed or s["seed"], "file": str(fn)})
+        results.append({"shot": args.shot, "seed": seed, "file": str(fn)})
         print(f"[gen] {args.shot} -> {fn.name}", flush=True)
         del pipe
         gc.collect()
-        if DEVICE == "mps":
+        if device == "mps":
             torch.mps.empty_cache()
-    (OUT / f"{args.shot}_buildlog.json").write_text(json.dumps({
-        "stack": "SDXL + char LoRA (w1.0)", "res": [W, H], "steps": STEPS, "cfg": CFG,
-        "trigger": TRIGGER, "results": results}, indent=2))
+    (out_dir / f"{args.shot}_buildlog.json").write_text(json.dumps({
+        "stack": "SDXL + char LoRA (w1.0)", "res": [w, h], "steps": ctx["steps"], "cfg": ctx["cfg"],
+        "trigger": ctx["triggers"].get(char, ""), "results": results}, indent=2))
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="Identity-lock keyframe (reference)")
-    ap.add_argument("--shot", default="S01", choices=list(SHOTS))
+    ap.add_argument("--shot", default="S01")
     ap.add_argument("--seed", type=int, default=0)
     ap.add_argument("--char", default="demo_character")
+    ap.add_argument("--project", help="project root or project.yaml")
     ap.add_argument("--multichar", action="store_true",
                     help="multi-character shot: plate->region-inpaint (see recipe/IDENTITY_LOCK.md)")
     ap.add_argument("--stage", choices=["plate", "faces"], default="plate")
@@ -175,9 +270,17 @@ def main() -> int:
     args = ap.parse_args()
     if args.multichar:
         print("[multichar] plate->region-inpaint is described in recipe/IDENTITY_LOCK.md; "
-              "this reference ships the single-character path. Wire your inpaint pipeline per that doc.")
+            "this reference ships the single-character path. Wire your inpaint pipeline per that doc.")
         return 0
-    gen_single(args)
+    try:
+        ctx = load_project_context(args.project) if args.project else default_context()
+    except ProjectError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    if args.shot not in ctx["shots"]:
+        print(f"[error] unknown shot {args.shot}; known shots: {', '.join(ctx['shots'])}", file=sys.stderr)
+        return 1
+    gen_single(args, ctx)
     return 0
 
 

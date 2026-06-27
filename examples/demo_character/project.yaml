@@ -1,0 +1,86 @@
+schema_version: "1.0"
+project_id: demo_character
+title: "Demo character (public-domain) — end-to-end example"
+logline: "A tiny public-domain reference film for the identity-locked pipeline wiring."
+
+paths:
+  root: .
+  frames: frames
+  anim: anim
+  vo_clips: vo_clips
+  score: score
+  output: output
+  work: _assemble_work
+
+identity:
+  demo_character:
+    trigger: demochar
+    wardrobe: "in a green hood and tunic, a longbow on his back"
+    lora_dir: demo_character_lora_unet_peft
+    face_crop: demo_character_canonical_face.png
+
+style: "watercolor storybook, warm earth palette, painterly"
+
+negatives:
+  base: "photo, realistic, 3d render, cgi, plastic, harsh light, text, watermark, deformed, extra limbs, bad hands, fused fingers, lowres, off-model, identity change, blue tunic, blue hood, blue garment, blue clothing"
+  solo_extra: ", multiple people, two people, second person, duplicate person, crowd"
+  two_figure: "photo, realistic, 3d render, cgi, plastic, harsh light, text, watermark, deformed, extra limbs, bad hands, fused fingers, lowres, off-model"
+
+render:
+  res: [1216, 704]
+  fps: 24
+  keyframe:
+    steps: 34
+    cfg: 6.5
+  animate:
+    guide_scale: 5.0
+    shift: 5.0
+    scheduler: unipc
+    steps_low: 24
+    steps_fix: 30
+
+shots:
+  - id: S01
+    who: [demo_character]
+    scene: scene1
+    seed: 1234
+    solo: true
+    keyframe_prompt: "demochar, a young outlaw in a green hood and tunic, a longbow on his back, standing in a sunlit forest clearing"
+    motion_prompt: "watercolor storybook animation, a young outlaw standing calmly in a sunlit forest clearing, leaves drifting slowly, gentle dappled light shifting, his body still and steady, only the foliage and light move, painterly, warm"
+    motion_note: "ambient leaf/light drift, figure held"
+    duration_s: 5
+  - id: S02
+    who: [demo_character]
+    scene: scene1
+    seed: 2345
+    solo: false
+    keyframe_prompt: "demochar and a companion in a green hood and tunic, a longbow on his back, walking a forest path together"
+    motion_prompt: "watercolor storybook animation, two figures walking a forest path together at an easy pace, both remain present, neither fades nor merges, soft secondary motion in the trees, painterly, warm"
+    motion_note: "two-figure walk, both remain"
+    duration_s: 3
+
+vo:
+  casting:
+    narrator: "<your-locale>-<VoiceName>Neural"
+    character_a: "<your-locale>-<VoiceName>Neural"
+  lines:
+    - tag: S01
+      speaker: narrator
+      text: "The forest was quiet that morning."
+    - tag: S02
+      speaker: character_a
+      text: "We should keep moving while the light holds."
+
+score:
+  cues:
+    - name: C01_open
+      prompt: "soft solo piano, gentle and warm, slow, intimate, no drums"
+      target_s: 8
+    - name: C02_wander
+      prompt: "light strings and a bamboo flute, wandering and curious, no percussion"
+      target_s: 10
+    - name: C03_resolve
+      prompt: "warm strings resolving, hopeful but quiet, gentle, no drums"
+      target_s: 8
+
+mode: full

@@ -24,20 +24,24 @@ CLI:
   run.py next          # the next runnable stage + its exact command + governor call
   run.py order         # just the topological build order
   run.py gates         # the gate map (which gate guards which stage advance)
+  run.py proof --project <root-or-yaml> [proof args]
 """
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 
 import yaml
 
 PIPE_DIR = Path(__file__).resolve().parent
+PROJ_ROOT = PIPE_DIR.parent
 sys.path.insert(0, str(PIPE_DIR))
 import checkpoint as ckpt_store          # noqa: E402  (sibling module)
 import tools as registry                 # noqa: E402
 
 MANIFEST = PIPE_DIR / "pipeline.yaml"
+CONFIG_FILES = (PROJ_ROOT / "config.yaml", PROJ_ROOT / "config.example.yaml")
 
 
 def _topo(stages: list[dict]) -> list[str]:
@@ -65,6 +69,16 @@ def _load():
     man = yaml.safe_load(MANIFEST.read_text())
     reg = registry.load_registry()
     return man, reg
+
+
+def _load_config() -> tuple[dict, Path | None]:
+    for path in CONFIG_FILES:
+        if path.exists():
+            try:
+                return yaml.safe_load(path.read_text()) or {}, path
+            except Exception:
+                return {}, path
+    return {}, None
 
 
 def _stage_runnable(stage: dict) -> tuple[bool, str]:
@@ -135,6 +149,7 @@ def cmd_plan() -> int:
 
 def cmd_next() -> int:
     man, reg = _load()
+    cfg, _cfg_path = _load_config()
     order = _topo(man["stages"])
     tools = reg.get("tools", {})
     for sid in order:
@@ -156,7 +171,10 @@ def cmd_next() -> int:
         print(f"  director     : {st.get('director_skill')}")
         gb = tool.get("governor_est_gb", 0.0)
         if gb and gb > 0:
-            print(f"  governor    : acquire_slot('{sid}_<tag>', est_gb={gb}, timeout_s=7200)  # RAM-budget gate: concurrent if it fits, blocks when the budget would be exceeded")
+            gov_path = cfg.get("governor_path") or reg.get("governor") or "<PATH_TO>/memory_governor.py"
+            timeout_s = cfg.get("governor_timeout_s", 7200)
+            print(f"  governor    : {gov_path}")
+            print(f"                acquire_slot('{sid}_<tag>', est_gb={gb}, timeout_s={timeout_s})  # RAM-budget gate: concurrent if it fits, blocks when the budget would be exceeded")
         else:
             print(f"  governor    : none needed ({tool.get('runtime')}, est_gb={gb})")
         inv = tool.get("invocation", {})
@@ -174,8 +192,15 @@ def cmd_next() -> int:
     return 0
 
 
+def cmd_proof(args: list[str]) -> int:
+    proof = PROJ_ROOT / "recipe" / "proof_assets.py"
+    return subprocess.run(["python3", str(proof)] + args).returncode
+
+
 def main() -> int:
     cmd = sys.argv[1] if len(sys.argv) > 1 else "plan"
+    if cmd == "proof":
+        return cmd_proof(sys.argv[2:])
     return {"plan": cmd_plan, "next": cmd_next, "order": cmd_order, "gates": cmd_gates}.get(cmd, cmd_plan)()
 
 

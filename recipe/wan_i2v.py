@@ -26,10 +26,15 @@ Usage:
 from __future__ import annotations
 
 import contextlib
+import argparse
 import json
 import subprocess
 import sys
 from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "pipeline"))
+from project import ProjectError, frame_count_for_seconds, load_project, project_paths  # noqa: E402
 
 # --- OPTIONAL governor (use yours, else a no-op; see recipe/GOVERNOR.md) ----------------
 try:
@@ -44,7 +49,6 @@ except Exception:  # pragma: no cover
 WAN_PY = "<PATH_TO>/python"                                  # the venv python that has mlx_video
 MODEL_DIR = "<PATH_TO>/Wan2.2-TI2V-5B-MLX"                   # the local Wan2.2 checkpoint dir
 
-ROOT = Path(__file__).resolve().parent.parent
 KF_DIR = ROOT / "examples" / "demo_character" / "frames"
 OUT_DIR = ROOT / "examples" / "demo_character" / "anim"
 
@@ -85,6 +89,72 @@ SHOTS = [
 ]
 
 
+def default_context() -> dict:
+    shots = []
+    for tag, kf, nframes, seed, prompt, note in SHOTS:
+        shots.append({
+            "tag": tag,
+            "keyframe": kf,
+            "out_dir": OUT_DIR,
+            "frames": nframes,
+            "seed": seed,
+            "prompt": prompt,
+            "motion_note": note,
+            "two_figure": tag in TWO_FIGURE_TAGS,
+        })
+    return {
+        "shots": shots,
+        "manifest_dir": OUT_DIR,
+        "res": [W, H],
+        "guide": GUIDE,
+        "shift": SHIFT,
+        "fps": FPS,
+        "scheduler": "unipc",
+        "steps_low": 24,
+        "steps_fix": 30,
+        "wan_py": WAN_PY,
+        "model_dir": MODEL_DIR,
+    }
+
+
+def load_project_context(project_arg: str) -> dict:
+    proj = load_project(project_arg)
+    paths = project_paths(proj)
+    render = proj.get("render") or {}
+    animate = render.get("animate") or {}
+    res = render.get("res") or [W, H]
+    fps = int(render.get("fps") or FPS)
+    shots = []
+    for shot in proj.get("shots") or []:
+        tag = shot.get("id", "")
+        scene = shot.get("scene")
+        kf_dir = paths["frames"] / scene if scene else paths["frames"]
+        out_dir = paths["anim"] / scene if scene else paths["anim"]
+        shots.append({
+            "tag": tag,
+            "keyframe": kf_dir / f"{tag}.png",
+            "out_dir": out_dir,
+            "frames": frame_count_for_seconds(shot.get("duration_s", 0), fps=fps),
+            "seed": int(shot.get("seed") or 0),
+            "prompt": shot.get("motion_prompt", ""),
+            "motion_note": shot.get("motion_note", ""),
+            "two_figure": shot.get("solo") is False,
+        })
+    return {
+        "shots": shots,
+        "manifest_dir": paths["anim"],
+        "res": res,
+        "guide": float(animate.get("guide_scale", GUIDE)),
+        "shift": float(animate.get("shift", SHIFT)),
+        "fps": fps,
+        "scheduler": animate.get("scheduler", "unipc"),
+        "steps_low": int(animate.get("steps_low", 24)),
+        "steps_fix": int(animate.get("steps_fix", 30)),
+        "wan_py": WAN_PY,
+        "model_dir": MODEL_DIR,
+    }
+
+
 def frames_of(mp4: Path) -> int:
     out = subprocess.run(
         ["ffprobe", "-v", "error", "-select_streams", "v:0", "-count_frames",
@@ -96,42 +166,55 @@ def frames_of(mp4: Path) -> int:
         return -1
 
 
-def run_shot(tag, kf, nframes, seed, prompt, motion_note, steps) -> dict:
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    out_mp4 = OUT_DIR / f"{tag}_anim.mp4"
+def run_shot(shot: dict, ctx: dict, steps: int) -> dict:
+    tag = shot["tag"]
+    out_dir = shot["out_dir"]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_mp4 = out_dir / f"{tag}_anim.mp4"
     if out_mp4.exists():
         print(f"[skip] {tag} exists -> {out_mp4.name}", flush=True)
         return {"shot": tag, "skipped": True, "file": str(out_mp4)}
-    neg = TWO_FIGURE_NEG if tag in TWO_FIGURE_TAGS else STYLE_NEG
+    neg = TWO_FIGURE_NEG if shot["two_figure"] else STYLE_NEG
+    w, h = ctx["res"]
     cmd = [
-        WAN_PY, "-m", "mlx_video.models.wan_2.generate",
-        "--model-dir", MODEL_DIR, "--image", str(kf), "--prompt", prompt,
-        "--negative-prompt", neg, "--width", str(W), "--height", str(H),
-        "--num-frames", str(nframes), "--steps", str(steps),
-        "--guide-scale", str(GUIDE), "--shift", str(SHIFT),
-        "--scheduler", "unipc", "--seed", str(seed), "--fps", str(FPS),
+        ctx["wan_py"], "-m", "mlx_video.models.wan_2.generate",
+        "--model-dir", ctx["model_dir"], "--image", str(shot["keyframe"]), "--prompt", shot["prompt"],
+        "--negative-prompt", neg, "--width", str(w), "--height", str(h),
+        "--num-frames", str(shot["frames"]), "--steps", str(steps),
+        "--guide-scale", str(ctx["guide"]), "--shift", str(ctx["shift"]),
+        "--scheduler", ctx["scheduler"], "--seed", str(shot["seed"]), "--fps", str(ctx["fps"]),
         "--output", str(out_mp4),
     ]
-    print(f"[gen] {tag} seed={seed} frames={nframes} steps={steps} :: {motion_note}", flush=True)
+    print(f"[gen] {tag} seed={shot['seed']} frames={shot['frames']} steps={steps} :: {shot['motion_note']}", flush=True)
     # NOTE: flag names follow a typical Wan2.2 MLX CLI; adjust to your generator's CLI.
     subprocess.run(cmd, check=True)
-    return {"shot": tag, "seed": seed, "frames_requested": nframes,
+    return {"shot": tag, "seed": shot["seed"], "frames_requested": shot["frames"],
             "frames_actual": frames_of(out_mp4), "file": str(out_mp4)}
 
 
 def main() -> int:
-    want = set(sys.argv[1:])
-    shots = [s for s in SHOTS if not want or s[0] in want or any(s[0].startswith(w) for w in want)]
+    ap = argparse.ArgumentParser(description="Wan2.2 I2V animate pass (reference)")
+    ap.add_argument("tags", nargs="*", help="optional shot ids or prefixes")
+    ap.add_argument("--project", help="project root or project.yaml")
+    args = ap.parse_args()
+    try:
+        ctx = load_project_context(args.project) if args.project else default_context()
+    except ProjectError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    want = set(args.tags)
+    shots = [s for s in ctx["shots"] if not want or s["tag"] in want or any(s["tag"].startswith(w) for w in want)]
     results = []
-    for tag, kf, nframes, seed, prompt, note in shots:
-        steps = 30 if tag in TWO_FIGURE_TAGS else 24
-        with acquire_slot(f"animate_{tag}", est_gb=22.0, timeout_s=10800):
-            results.append(run_shot(tag, kf, nframes, seed, prompt, note, steps))
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    (OUT_DIR / "animation_manifest.json").write_text(json.dumps({
-        "engine": "Wan2.2 I2V (MLX)", "res": [W, H], "fps": FPS,
-        "guide": GUIDE, "shift": SHIFT, "scheduler": "unipc", "results": results}, indent=2))
-    print(f"[done] {len(results)} shot(s) -> {OUT_DIR}", flush=True)
+    for shot in shots:
+        steps = ctx["steps_fix"] if shot["two_figure"] else ctx["steps_low"]
+        with acquire_slot(f"animate_{shot['tag']}", est_gb=22.0, timeout_s=10800):
+            results.append(run_shot(shot, ctx, steps))
+    ctx["manifest_dir"].mkdir(parents=True, exist_ok=True)
+    (ctx["manifest_dir"] / "animation_manifest.json").write_text(json.dumps({
+        "engine": "Wan2.2 I2V (MLX)", "res": ctx["res"], "fps": ctx["fps"],
+        "guide": ctx["guide"], "shift": ctx["shift"], "scheduler": ctx["scheduler"],
+        "results": results}, indent=2))
+    print(f"[done] {len(results)} shot(s) -> {ctx['manifest_dir']}", flush=True)
     return 0
 
 

@@ -25,11 +25,15 @@ Usage:
 from __future__ import annotations
 
 import json
+import argparse
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "pipeline"))
+from project import ProjectError, frame_count_for_seconds, load_project, project_paths  # noqa: E402
+
 DEMO = ROOT / "examples" / "demo_character"
 ANIM = DEMO / "anim"
 WORK = DEMO / "_assemble_work"
@@ -50,6 +54,53 @@ WINDOWS = {
 }
 
 
+def default_context() -> dict:
+    return {
+        "root": DEMO,
+        "anim": ANIM,
+        "work": WORK,
+        "out": OUT,
+        "fps": FPS,
+        "crf": CRF,
+        "label": LABEL,
+        "source_timeline": SOURCE_TIMELINE,
+        "mixed_audio": MIXED_AUDIO,
+        "windows": dict(WINDOWS),
+        "clips": {tag: ANIM / f"{tag}_anim.mp4" for tag in WINDOWS},
+    }
+
+
+def load_project_context(project_arg: str) -> dict:
+    proj = load_project(project_arg)
+    paths = project_paths(proj)
+    render = proj.get("render") or {}
+    fps = int(render.get("fps") or FPS)
+    windows = {}
+    clips = {}
+    start = 0
+    for shot in proj.get("shots") or []:
+        tag = shot.get("id", "")
+        frames = frame_count_for_seconds(shot.get("duration_s", 0), fps=fps)
+        windows[tag] = (start, start + frames)
+        start += frames
+        scene = shot.get("scene")
+        clip_dir = paths["anim"] / scene if scene else paths["anim"]
+        clips[tag] = clip_dir / f"{tag}_anim.mp4"
+    return {
+        "root": paths["root"],
+        "anim": paths["anim"],
+        "work": paths["work"],
+        "out": paths["output"],
+        "fps": fps,
+        "crf": CRF,
+        "label": proj.get("project_id") or LABEL,
+        "source_timeline": paths["root"] / "timeline_noaudio_source.mp4",
+        "mixed_audio": paths["root"] / "mixed_audio.m4a",
+        "windows": windows,
+        "clips": clips,
+    }
+
+
 def _ff(cmd: list[str]) -> None:
     print("[ffmpeg]", " ".join(str(c) for c in cmd), flush=True)
     subprocess.run(cmd, check=True)
@@ -66,72 +117,82 @@ def frames_of(mp4: Path) -> int:
         return -1
 
 
-def load_holds() -> set[str]:
-    hp = DEMO / "hold.json"
+def load_holds(root: Path) -> set[str]:
+    hp = root / "hold.json"
     if hp.exists():
         return set(json.loads(hp.read_text()).get("hold", []))
     return set()
 
 
-def reencode_uniform(src: Path, dst: Path) -> None:
+def reencode_uniform(src: Path, dst: Path, fps: int, crf: int) -> None:
     """Re-encode a clip to the uniform codec/fps/pix_fmt so the concat is clean."""
-    _ff(["ffmpeg", "-y", "-i", str(src), "-r", str(FPS), "-c:v", "libx264",
-         "-profile:v", "high", "-pix_fmt", "yuv420p", "-crf", str(CRF), "-an", str(dst)])
+    _ff(["ffmpeg", "-y", "-i", str(src), "-r", str(fps), "-c:v", "libx264",
+         "-profile:v", "high", "-pix_fmt", "yuv420p", "-crf", str(crf), "-an", str(dst)])
 
 
-def build_base() -> Path:
+def build_base(ctx: dict) -> Path:
     """Re-encode each per-shot clip uniformly and concat in film order -> video-noaudio."""
-    WORK.mkdir(parents=True, exist_ok=True)
-    holds = load_holds()
-    concat_list = WORK / "concat_base.txt"
+    work = ctx["work"]
+    work.mkdir(parents=True, exist_ok=True)
+    holds = load_holds(ctx["root"])
+    concat_list = work / "concat_base.txt"
     lines = []
-    for tag in WINDOWS:
-        clip = ANIM / f"{tag}_anim.mp4"
+    for tag in ctx["windows"]:
+        clip = ctx["clips"].get(tag, ctx["anim"] / f"{tag}_anim.mp4")
         if tag in holds:
             # HOLD: use the static/Ken-Burns fallback clip instead (no code edit).
-            clip = ANIM / f"{tag}_hold.mp4"
+            clip = clip.with_name(f"{tag}_hold.mp4")
             print(f"[hold] {tag} -> static fallback {clip.name}", flush=True)
         if not clip.exists():
             print(f"[warn] missing clip for {tag}: {clip} (skipping in this reference run)", flush=True)
             continue
-        uni = WORK / f"{tag}_uni.mp4"
-        reencode_uniform(clip, uni)
+        uni = work / f"{tag}_uni.mp4"
+        reencode_uniform(clip, uni, ctx["fps"], ctx["crf"])
         lines.append(f"file '{uni.as_posix()}'")
     concat_list.write_text("\n".join(lines) + "\n")
-    base = WORK / f"full_video_noaudio_{LABEL}.mp4"
+    base = work / f"full_video_noaudio_{ctx['label']}.mp4"
     _ff(["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(concat_list),
          "-c", "copy", str(base)])
     # Frame-exact guard: if you have a SOURCE_TIMELINE, the produced frames must match it.
-    if SOURCE_TIMELINE.exists():
-        bf, sf = frames_of(base), frames_of(SOURCE_TIMELINE)
+    if ctx["source_timeline"].exists():
+        bf, sf = frames_of(base), frames_of(ctx["source_timeline"])
         assert bf == sf, f"FRAME DRIFT: produced {bf} != source {sf} (timeline-drift trip)"
         print(f"[guard] frame-exact OK ({bf} == {sf})", flush=True)
     return base
 
 
-def mux(base: Path) -> Path:
+def mux(ctx: dict, base: Path) -> Path:
     """Mux the mixed audio onto the base cut (byte-for-byte audio copy)."""
-    OUT.mkdir(parents=True, exist_ok=True)
-    out = OUT / f"film_{LABEL}.mp4"
-    if MIXED_AUDIO.exists():
-        _ff(["ffmpeg", "-y", "-i", str(base), "-i", str(MIXED_AUDIO),
+    ctx["out"].mkdir(parents=True, exist_ok=True)
+    out = ctx["out"] / f"film_{ctx['label']}.mp4"
+    if ctx["mixed_audio"].exists():
+        _ff(["ffmpeg", "-y", "-i", str(base), "-i", str(ctx["mixed_audio"]),
              "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "copy",
              "-shortest", str(out)])
     else:
-        print(f"[warn] no mixed audio at {MIXED_AUDIO}; emitting video-only", flush=True)
+        print(f"[warn] no mixed audio at {ctx['mixed_audio']}; emitting video-only", flush=True)
         _ff(["ffmpeg", "-y", "-i", str(base), "-c", "copy", str(out)])
     print(f"[done] -> {out}", flush=True)
     return out
 
 
 def main() -> int:
-    cmd = sys.argv[1] if len(sys.argv) > 1 else "all"
+    ap = argparse.ArgumentParser(description="Frame-exact ffmpeg assemble (reference)")
+    ap.add_argument("cmd", nargs="?", choices=["base", "mux", "all"], default="all")
+    ap.add_argument("--project", help="project root or project.yaml")
+    args = ap.parse_args()
+    try:
+        ctx = load_project_context(args.project) if args.project else default_context()
+    except ProjectError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+    cmd = args.cmd
     if cmd in ("base", "all"):
-        base = build_base()
+        base = build_base(ctx)
     else:
-        base = WORK / f"full_video_noaudio_{LABEL}.mp4"
+        base = ctx["work"] / f"full_video_noaudio_{ctx['label']}.mp4"
     if cmd in ("mux", "all"):
-        mux(base)
+        mux(ctx, base)
     return 0
 
 

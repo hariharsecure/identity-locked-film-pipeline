@@ -21,6 +21,7 @@ Requires: transformers + torch (and ffmpeg on PATH). Runs on MPS/CUDA/CPU.
 from __future__ import annotations
 
 import contextlib
+import argparse
 import json
 import subprocess
 import sys
@@ -36,6 +37,9 @@ except Exception:  # pragma: no cover
         yield
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "pipeline"))
+from project import ProjectError, load_project, project_paths  # noqa: E402
+
 OUT = ROOT / "examples" / "demo_character" / "score"
 MODEL = "facebook/musicgen-small"
 LOUDNORM = "loudnorm=I=-18:TP=-2:LRA=11"
@@ -59,7 +63,28 @@ def ffprobe_seconds(path: Path) -> float:
         return 0.0
 
 
+def load_project_context(project_arg: str) -> tuple[Path, list[tuple[str, str, float]], str]:
+    proj = load_project(project_arg)
+    paths = project_paths(proj)
+    score = proj.get("score") or {}
+    cues = []
+    for cue in score.get("cues") or []:
+        cues.append((cue.get("name", ""), cue.get("prompt", ""), float(cue.get("target_s", 0))))
+    loudnorm = score.get("loudnorm") or score.get("loudnorm_target") or LOUDNORM
+    return paths["score"], cues, loudnorm
+
+
 def main() -> int:
+    ap = argparse.ArgumentParser(description="MusicGen score cue pass (reference)")
+    ap.add_argument("--project", help="project root or project.yaml")
+    args = ap.parse_args()
+    out_dir, cues, loudnorm = OUT, CUES, LOUDNORM
+    if args.project:
+        try:
+            out_dir, cues, loudnorm = load_project_context(args.project)
+        except ProjectError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
     try:
         import torch
         from transformers import AutoProcessor, MusicgenForConditionalGeneration
@@ -70,7 +95,7 @@ def main() -> int:
         return 1
     import scipy.io.wavfile  # type: ignore
 
-    OUT.mkdir(parents=True, exist_ok=True)
+    out_dir.mkdir(parents=True, exist_ok=True)
     device = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
     results = []
     with acquire_slot("score_musicgen", est_gb=6.0, timeout_s=7200):
@@ -78,24 +103,24 @@ def main() -> int:
         proc = AutoProcessor.from_pretrained(MODEL)
         model = MusicgenForConditionalGeneration.from_pretrained(MODEL).to(device)
         sr = model.config.audio_encoder.sampling_rate
-        for name, prompt, target_s in CUES:
+        for name, prompt, target_s in cues:
             inputs = proc(text=[prompt], padding=True, return_tensors="pt").to(device)
             max_tokens = int(target_s * 50)   # ~50 tokens/sec for MusicGen
             audio = model.generate(**inputs, max_new_tokens=max_tokens, do_sample=True, guidance_scale=3.0)
-            raw = OUT / f"{name}.raw.wav"
+            raw = out_dir / f"{name}.raw.wav"
             scipy.io.wavfile.write(str(raw), rate=sr, data=audio[0, 0].cpu().numpy())
-            final = OUT / f"{name}.wav"
-            subprocess.run(["ffmpeg", "-y", "-i", str(raw), "-af", LOUDNORM, "-ar", "44100", str(final)],
+            final = out_dir / f"{name}.wav"
+            subprocess.run(["ffmpeg", "-y", "-i", str(raw), "-af", loudnorm, "-ar", "44100", str(final)],
                            check=True)
             raw.unlink(missing_ok=True)
             actual = ffprobe_seconds(final)
             print(f"[cue] {name} target={target_s}s actual={actual:.1f}s -> {final.name}", flush=True)
             results.append({"cue": name, "prompt": prompt, "target_s": target_s,
                             "actual_s": actual, "file": str(final)})
-    (OUT / "SCORE_MANIFEST.json").write_text(json.dumps(
-        {"model": MODEL, "license": "CC-BY-NC-4.0 (non-commercial)", "loudnorm": LOUDNORM,
+    (out_dir / "SCORE_MANIFEST.json").write_text(json.dumps(
+        {"model": MODEL, "license": "CC-BY-NC-4.0 (non-commercial)", "loudnorm": loudnorm,
          "results": results}, indent=2))
-    print(f"[done] {len(results)} cue(s) -> {OUT}", flush=True)
+    print(f"[done] {len(results)} cue(s) -> {out_dir}", flush=True)
     return 0
 
 
